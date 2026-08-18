@@ -1,0 +1,13 @@
+numpy
+scipy
+SimpleITK
+scikit-image
+nibabel
+
+brainles-preprocessing
+antspyx
+
+torch==2.13.0
+nnunetv2
+
+matplotlib
