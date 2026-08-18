@@ -574,25 +574,3 @@ The repository uses:
 
 ---
 
-# 16. Citation
-
-If you use this implementation, please cite the associated publication:
-
-```bibtex
-@inproceedings{MEDNEXTPP_ISLES_2026,
-    title     = {<FINAL PAPER TITLE>},
-    author    = {<AUTHORS>},
-    booktitle = {MICCAI SWITCH+ Workshop},
-    year      = {2026}
-}
-```
-
-The citation information will be updated with the final publication details.
-
----
-
-# 17. License
-
-This repository is intended for research and academic use.
-
-Please also refer to the licenses and attribution requirements of the third-party frameworks and implementations used by this project, including nnU-Net, MedNeXt, BrainLes preprocessing, ANTs, and PyTorch.
