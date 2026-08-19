@@ -4,29 +4,55 @@ MedNeXt++ inference pipeline.
 Pipeline
 --------
 MNI-space MRI
-    -> trained MedNeXt++ checkpoint
-    -> probability prediction
-    -> probability thresholding
-    -> MNI-space binary segmentation
-    -> inverse affine transformation
-    -> native-space segmentation
-    -> optional visualization
+    ↓
+Z-score normalization
+    ↓
+MedNeXt++ Base (B)
+    ↓
+Sliding-window inference
+    ↓
+Probability map
+    ↓
+Threshold = 0.35
+    ↓
+Binary MNI segmentation
+    ↓
+Inverse affine transform
+    ↓
+Native-space segmentation
+    ↓
+Optional visualization
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import subprocess
-import tempfile
 from pathlib import Path
-import shutil
 
 import ants
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
+
+from batchgenerators.utilities.file_and_folder_operations import load_json
+from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+
+from nnunet_mednext.network_architecture.mednextpp.create_mednextpp import (
+    create_mednextpp,
+)
+
+
+# =============================================================================
+# DEFAULT SETTINGS
+# =============================================================================
+
+DEFAULT_THRESHOLD = 0.35
+DEFAULT_TILE_STEP_SIZE = 0.25
+DEFAULT_CONFIGURATION = "3d_fullres"
+DEFAULT_FOLD = 0
 
 
 # =============================================================================
@@ -39,7 +65,7 @@ def inverse_transform(
     affine: Path,
 ) -> ants.ANTsImage:
     """
-    Transform a segmentation from MNI space back to native space.
+    Transform a binary segmentation from MNI space back to native space.
     """
 
     if not affine.exists():
@@ -98,16 +124,11 @@ def visualize_prediction(
     save_path: Path,
 ) -> None:
     """
-    Create axial, coronal and sagittal views of the
-    native-space MedNeXt++ prediction.
+    Create axial, coronal and sagittal views of the native-space prediction.
     """
 
     raw = native_mri.numpy()
     prediction = native_prediction.numpy().astype(bool)
-
-    # -------------------------------------------------------------------------
-    # Select slices containing the largest predicted lesion
-    # -------------------------------------------------------------------------
 
     if np.any(prediction):
 
@@ -144,49 +165,26 @@ def visualize_prediction(
     for row, (plane, idx) in enumerate(planes):
 
         if plane == "Axial":
-
             mri = raw[:, :, idx]
             pred = prediction[:, :, idx]
 
         elif plane == "Coronal":
-
             mri = np.rot90(raw[:, idx, :])
-            pred = np.rot90(
-                prediction[:, idx, :]
-            )
+            pred = np.rot90(prediction[:, idx, :])
 
         else:
-
             mri = np.rot90(raw[idx, :, :])
-            pred = np.rot90(
-                prediction[idx, :, :]
-            )
-
-        # ---------------------------------------------------------------------
-        # Crop around brain
-        # ---------------------------------------------------------------------
+            pred = np.rot90(prediction[idx, :, :])
 
         mri, row_slice, col_slice = crop_to_brain(mri)
-
         pred = pred[row_slice, col_slice]
-
-        # ---------------------------------------------------------------------
-        # MRI
-        # ---------------------------------------------------------------------
 
         axes[row, 0].imshow(
             mri,
             cmap="gray",
             interpolation="nearest",
         )
-
-        axes[row, 0].set_title(
-            f"{plane} - MRI"
-        )
-
-        # ---------------------------------------------------------------------
-        # Prediction overlay
-        # ---------------------------------------------------------------------
+        axes[row, 0].set_title(f"{plane} - MRI")
 
         axes[row, 1].imshow(
             mri,
@@ -199,9 +197,7 @@ def visualize_prediction(
                 pred == 0,
                 pred,
             ),
-            cmap=ListedColormap(
-                ["deepskyblue"]
-            ),
+            cmap=ListedColormap(["deepskyblue"]),
             alpha=0.55,
             interpolation="nearest",
         )
@@ -247,210 +243,327 @@ def visualize_prediction(
 
 
 # =============================================================================
-# MNI-SPACE MODEL INFERENCE
+# MODEL INITIALIZATION
+# =============================================================================
+
+def initialize_model(
+    checkpoint_path: Path,
+    dataset_json_path: Path,
+    plans_json_path: Path,
+    configuration_name: str = DEFAULT_CONFIGURATION,
+    tile_step_size: float = DEFAULT_TILE_STEP_SIZE,
+) -> dict:
+    """
+    Initialize the exact MedNeXt++ Base (B) model and nnU-Net predictor.
+    """
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found:\n{checkpoint_path}"
+        )
+
+    if not dataset_json_path.exists():
+        raise FileNotFoundError(
+            f"dataset.json not found:\n{dataset_json_path}"
+        )
+
+    if not plans_json_path.exists():
+        raise FileNotFoundError(
+            f"plans.json not found:\n{plans_json_path}"
+        )
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    print("=" * 70)
+    print("MEDNEXT++ INITIALIZATION")
+    print("=" * 70)
+    print("Device:", device)
+    print("Checkpoint:", checkpoint_path)
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    # -------------------------------------------------------------------------
+    # Exact MedNeXt++ model used in Docker
+    # -------------------------------------------------------------------------
+
+    model = create_mednextpp(
+        num_input_channels=1,
+        num_classes=2,
+        model_id="B",
+        kernel_size=3,
+        deep_supervision=True,
+    )
+
+    missing, unexpected = model.load_state_dict(
+        checkpoint["network_weights"],
+        strict=False,
+    )
+
+    if missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint/model mismatch detected.\n"
+            f"Missing keys: {missing}\n"
+            f"Unexpected keys: {unexpected}"
+        )
+
+    model = model.to(device)
+    model.eval()
+
+    # -------------------------------------------------------------------------
+    # Load nnU-Net metadata
+    # -------------------------------------------------------------------------
+
+    dataset_json = load_json(
+        str(dataset_json_path)
+    )
+
+    plans = load_json(
+        str(plans_json_path)
+    )
+
+    plans_manager = PlansManager(plans)
+
+    configuration = plans_manager.get_configuration(
+        configuration_name
+    )
+
+    # -------------------------------------------------------------------------
+    # Exact predictor settings from Docker
+    # -------------------------------------------------------------------------
+
+    predictor = nnUNetPredictor(
+        tile_step_size=tile_step_size,
+        use_gaussian=True,
+        use_mirroring=True,
+        perform_everything_on_device=(
+            device.type == "cuda"
+        ),
+        device=device,
+        verbose=True,
+        verbose_preprocessing=False,
+        allow_tqdm=True,
+    )
+
+    predictor.network = model
+    predictor.device = device
+    predictor.configuration_manager = configuration
+    predictor.plans_manager = plans_manager
+    predictor.dataset_json = dataset_json
+    predictor.label_manager = (
+        plans_manager.get_label_manager(
+            dataset_json
+        )
+    )
+
+    if "inference_allowed_mirroring_axes" in checkpoint:
+        predictor.allowed_mirroring_axes = (
+            checkpoint["inference_allowed_mirroring_axes"]
+        )
+
+    print("Model: MedNeXt++ Base (B)")
+    print(f"Tile step size: {tile_step_size}")
+    print("Gaussian weighting: True")
+    print("Mirroring: True")
+    print("=" * 70)
+
+    return {
+        "model": model,
+        "device": device,
+        "predictor": predictor,
+    }
+
+
+# =============================================================================
+# MEDNEXT++ MNI INFERENCE
 # =============================================================================
 
 def run_model_inference(
-    mni_mri: Path,
-    model_results: Path,
-    dataset_id: int,
-    configuration: str,
-    trainer: str,
-    fold: int,
-    threshold: float = 0.35,
+    mni_mri_path: Path,
+    predictor: nnUNetPredictor,
+    device: torch.device,
+    threshold: float = DEFAULT_THRESHOLD,
 ) -> Path:
     """
-    Run nnU-Net inference using the trained MedNeXt++ model.
-
-    The model produces probability maps, after which a custom lesion
-    probability threshold is applied to generate a binary MNI-space mask.
+    Run MedNeXt++ inference directly on an MNI-space MRI.
     """
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-
-        temp_dir = Path(temp_dir)
-
-        input_dir = temp_dir / "input"
-        output_dir = temp_dir / "output"
-
-        input_dir.mkdir()
-        output_dir.mkdir()
-
-        # ---------------------------------------------------------------------
-        # nnU-Net expected input
-        # ---------------------------------------------------------------------
-
-        input_case = input_dir / "case_0000.nii.gz"
-
-        shutil.copy2(
-            mni_mri,
-            input_case,
+    if not mni_mri_path.exists():
+        raise FileNotFoundError(
+            f"MNI MRI not found:\n{mni_mri_path}"
         )
 
-        # ---------------------------------------------------------------------
-        # Run nnU-Net inference
-        # ---------------------------------------------------------------------
+    mni_sitk = ants.image_read(
+        str(mni_mri_path)
+    )
 
-        command = [
-            "nnUNetv2_predict",
+    mni_array = (
+        mni_sitk.numpy()
+        .astype(np.float32)
+    )
 
-            "-i",
-            str(input_dir),
+    # -------------------------------------------------------------------------
+    # Same z-score normalization used in Docker inference
+    # -------------------------------------------------------------------------
 
-            "-o",
-            str(output_dir),
+    mean = mni_array.mean()
+    std = mni_array.std()
 
-            "-d",
-            str(dataset_id),
+    mni_array = (
+        mni_array - mean
+    ) / (std + 1e-8)
 
-            "-c",
-            configuration,
+    # -------------------------------------------------------------------------
+    # Prepare predictor input: [C, Z, Y, X]
+    # -------------------------------------------------------------------------
 
-            "-tr",
-            trainer,
+    image = (
+        torch.from_numpy(mni_array)
+        .float()
+        .unsqueeze(0)
+    )
 
-            "-f",
-            str(fold),
+    print("\nRunning MedNeXt++ sliding-window inference...")
 
-            "--save_probabilities",
-        ]
-
-        env = os.environ.copy()
-
-        if model_results is not None:
-            env["nnUNet_results"] = str(model_results)
-
-        print("\nRunning MedNeXt++ inference...")
-        print(" ".join(command))
-
-        subprocess.run(
-            command,
-            check=True,
-            env=env,
+    with torch.no_grad():
+        logits = predictor.predict_sliding_window_return_logits(
+            image
         )
 
-        # ---------------------------------------------------------------------
-        # Load saved probability map
-        # ---------------------------------------------------------------------
-
-        probability_file = output_dir / "case.npz"
-
-        if not probability_file.exists():
-            raise RuntimeError(
-                "nnU-Net probability file was not found:\n"
-                f"{probability_file}"
-            )
-
-        probability_data = np.load(
-            probability_file
+    if isinstance(logits, torch.Tensor):
+        logits = (
+            logits
+            .detach()
+            .cpu()
+            .numpy()
         )
 
-        if "probabilities" not in probability_data:
-            raise RuntimeError(
-                "The .npz file does not contain a 'probabilities' array."
-            )
+    logits = np.asarray(
+        logits,
+        dtype=np.float32,
+    )
 
-        probabilities = probability_data["probabilities"]
+    if logits.ndim == 5:
+        logits = logits[0]
 
-        # ---------------------------------------------------------------------
-        # Binary lesion segmentation
-        #
-        # Channel 1 = lesion probability for binary segmentation
-        # ---------------------------------------------------------------------
-
-        if probabilities.ndim < 2:
-            raise RuntimeError(
-                f"Unexpected probability shape: {probabilities.shape}"
-            )
-
-        if probabilities.shape[0] < 2:
-            raise RuntimeError(
-                "Expected a background channel and a lesion channel."
-            )
-
-        lesion_probability = probabilities[1]
-
-        prediction_binary = (
-            lesion_probability >= threshold
-        ).astype(np.uint8)
-
-        # ---------------------------------------------------------------------
-        # Use MNI MRI geometry for output mask
-        # ---------------------------------------------------------------------
-
-        mni_reference = ants.image_read(
-            str(mni_mri)
+    if logits.ndim != 4:
+        raise RuntimeError(
+            f"Unexpected logits shape: {logits.shape}"
         )
 
-        prediction_mni_ants = ants.from_numpy(
-            prediction_binary,
-            origin=mni_reference.origin,
-            spacing=mni_reference.spacing,
-            direction=mni_reference.direction,
+    if logits.shape[0] != 2:
+        raise RuntimeError(
+            f"Expected 2 output classes, got {logits.shape[0]}"
         )
 
-        final_prediction = (
-            Path.cwd() / "prediction_mni.nii.gz"
-        )
+    # -------------------------------------------------------------------------
+    # Logits -> probabilities
+    # -------------------------------------------------------------------------
 
-        ants.image_write(
-            prediction_mni_ants,
-            str(final_prediction),
-        )
+    probabilities = torch.softmax(
+        torch.from_numpy(logits),
+        dim=0,
+    ).numpy()
 
-        print(
-            f"\nApplied probability threshold: {threshold:.2f}"
-        )
+    lesion_probability = (
+        probabilities[1]
+        .astype(np.float32)
+    )
 
-        print(
-            "\nMNI-space prediction saved to:"
-        )
-        print(final_prediction)
+    # -------------------------------------------------------------------------
+    # Probability -> binary mask
+    # -------------------------------------------------------------------------
 
-    return final_prediction
+    lesion_mask = (
+        lesion_probability >= threshold
+    ).astype(np.uint8)
+
+    print(
+        f"Probability threshold: {threshold:.2f}"
+    )
+
+    print(
+        "MNI lesion voxels:",
+        int(lesion_mask.sum()),
+    )
+
+    # -------------------------------------------------------------------------
+    # Save MNI prediction
+    # -------------------------------------------------------------------------
+
+    mni_prediction = ants.from_numpy(
+        lesion_mask,
+        origin=mni_sitk.origin,
+        spacing=mni_sitk.spacing,
+        direction=mni_sitk.direction,
+    )
+
+    output_path = (
+        Path.cwd() /
+        "prediction_mni.nii.gz"
+    )
+
+    ants.image_write(
+        mni_prediction,
+        str(output_path),
+    )
+
+    return output_path
 
 
 # =============================================================================
-# COMPLETE INFERENCE PIPELINE
+# COMPLETE PIPELINE
 # =============================================================================
 
 def run_inference(
     mni_mri_path: Path,
-    model_results: Path,
+    checkpoint_path: Path,
+    dataset_json_path: Path,
+    plans_json_path: Path,
     affine_path: Path,
     native_mri_path: Path,
     output_dir: Path,
-    dataset_id: int = 701,
-    configuration: str = "3d_fullres",
-    trainer: str = "nnUNetTrainer_MedNeXtPP",
-    fold: int = 0,
-    threshold: float = 0.35,
+    configuration: str = DEFAULT_CONFIGURATION,
+    fold: int = DEFAULT_FOLD,
+    threshold: float = DEFAULT_THRESHOLD,
+    tile_step_size: float = DEFAULT_TILE_STEP_SIZE,
     visualize: bool = True,
 ) -> Path:
-    """
-    Complete inference pipeline:
 
-        MNI MRI
-            ↓
-        MedNeXt++
-            ↓
-        probability map
-            ↓
-        threshold = 0.35
-            ↓
-        MNI binary prediction
-            ↓
-        inverse affine
-            ↓
-        native prediction
-            ↓
-        visualization
-    """
+    if not 0.0 < threshold < 1.0:
+        raise ValueError(
+            "Threshold must be between 0 and 1."
+        )
+
+    if not 0.0 < tile_step_size <= 1.0:
+        raise ValueError(
+            "Tile step size must be > 0 and <= 1."
+        )
 
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
+
+    # -------------------------------------------------------------------------
+    # Initialize model
+    # -------------------------------------------------------------------------
+
+    model_info = initialize_model(
+        checkpoint_path=checkpoint_path,
+        dataset_json_path=dataset_json_path,
+        plans_json_path=plans_json_path,
+        configuration_name=configuration,
+        tile_step_size=tile_step_size,
+    )
+
+    predictor = model_info["predictor"]
+    device = model_info["device"]
 
     # -------------------------------------------------------------------------
     # Load native MRI
@@ -461,72 +574,54 @@ def run_inference(
     )
 
     # -------------------------------------------------------------------------
-    # Model inference in MNI space
+    # MNI inference
     # -------------------------------------------------------------------------
 
     mni_prediction = run_model_inference(
-        mni_mri=mni_mri_path,
-        model_results=model_results,
-        dataset_id=dataset_id,
-        configuration=configuration,
-        trainer=trainer,
-        fold=fold,
+        mni_mri_path=mni_mri_path,
+        predictor=predictor,
+        device=device,
         threshold=threshold,
     )
 
-    # -------------------------------------------------------------------------
-    # Move MNI prediction to output directory
-    # -------------------------------------------------------------------------
-
-    mni_prediction_output = (
+    mni_output = (
         output_dir /
         "prediction_mni.nii.gz"
     )
 
-    shutil.copy2(
-        mni_prediction,
-        mni_prediction_output,
+    mni_prediction_img = ants.image_read(
+        str(mni_prediction)
+    )
+
+    ants.image_write(
+        mni_prediction_img,
+        str(mni_output),
     )
 
     # -------------------------------------------------------------------------
-    # Load MNI prediction
+    # MNI -> native
     # -------------------------------------------------------------------------
 
-    prediction_mni = ants.image_read(
-        str(mni_prediction_output)
-    )
-
-    # -------------------------------------------------------------------------
-    # Inverse transform: MNI -> native
-    # -------------------------------------------------------------------------
-
-    print(
-        "\nApplying inverse affine transformation..."
-    )
+    print("\nApplying inverse affine transformation...")
 
     prediction_native = inverse_transform(
-        moving=prediction_mni,
+        moving=mni_prediction_img,
         reference=native_mri,
         affine=affine_path,
     )
 
-    native_prediction_path = (
+    native_output = (
         output_dir /
         "prediction_native.nii.gz"
     )
 
     ants.image_write(
         prediction_native,
-        str(native_prediction_path),
+        str(native_output),
     )
 
-    print(
-        "\nNative prediction saved to:"
-    )
-
-    print(
-        native_prediction_path
-    )
+    print("\nNative prediction saved to:")
+    print(native_output)
 
     # -------------------------------------------------------------------------
     # Visualization
@@ -545,19 +640,14 @@ def run_inference(
             save_path=visualization_path,
         )
 
-        print(
-            "\nVisualization saved to:"
-        )
+        print("\nVisualization saved to:")
+        print(visualization_path)
 
-        print(
-            visualization_path
-        )
-
-    return native_prediction_path
+    return native_output
 
 
 # =============================================================================
-# COMMAND-LINE INTERFACE
+# COMMAND LINE
 # =============================================================================
 
 def parse_args() -> argparse.Namespace:
@@ -565,7 +655,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run MedNeXt++ inference from MNI space "
-            "to native space."
+            "to native patient space."
         )
     )
 
@@ -577,23 +667,31 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--model-results",
+        "--checkpoint",
         type=Path,
         required=True,
-        help=(
-            "nnUNet_results directory containing "
-            "the trained MedNeXt++ model."
-        ),
+        help="MedNeXt++ checkpoint_best.pth.",
+    )
+
+    parser.add_argument(
+        "--dataset-json",
+        type=Path,
+        required=True,
+        help="nnU-Net dataset.json.",
+    )
+
+    parser.add_argument(
+        "--plans-json",
+        type=Path,
+        required=True,
+        help="nnU-Net plans.json.",
     )
 
     parser.add_argument(
         "--affine",
         type=Path,
         required=True,
-        help=(
-            "Native-to-MNI affine transform generated "
-            "during preprocessing."
-        ),
+        help="Native-to-MNI affine transform.",
     )
 
     parser.add_argument(
@@ -607,46 +705,40 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("inference_results"),
-        help="Directory for prediction outputs.",
-    )
-
-    parser.add_argument(
-        "--dataset-id",
-        type=int,
-        default=701,
-        help="nnU-Net dataset ID.",
+        help="Output directory.",
     )
 
     parser.add_argument(
         "--configuration",
-        default="3d_fullres",
+        default=DEFAULT_CONFIGURATION,
         help="nnU-Net configuration.",
-    )
-
-    parser.add_argument(
-        "--trainer",
-        default="nnUNetTrainer_MedNeXtPP",
-        help="Custom nnU-Net trainer name.",
     )
 
     parser.add_argument(
         "--fold",
         type=int,
-        default=0,
-        help="Cross-validation fold.",
+        default=DEFAULT_FOLD,
+        help="Fold number.",
     )
 
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.35,
-        help="Probability threshold for lesion segmentation.",
+        default=DEFAULT_THRESHOLD,
+        help="Lesion probability threshold.",
+    )
+
+    parser.add_argument(
+        "--tile-step-size",
+        type=float,
+        default=DEFAULT_TILE_STEP_SIZE,
+        help="Sliding-window tile step size.",
     )
 
     parser.add_argument(
         "--no-visualization",
         action="store_true",
-        help="Do not generate the visualization.",
+        help="Disable visualization.",
     )
 
     return parser.parse_args()
@@ -660,20 +752,16 @@ def main() -> None:
 
     args = parse_args()
 
-    if not 0.0 < args.threshold < 1.0:
-        raise ValueError(
-            "Threshold must be between 0 and 1."
-        )
-
     required = {
         "MNI MRI": args.mni_mri,
-        "model results": args.model_results,
+        "checkpoint": args.checkpoint,
+        "dataset.json": args.dataset_json,
+        "plans.json": args.plans_json,
         "affine transform": args.affine,
         "native MRI": args.native_mri,
     }
 
     for name, path in required.items():
-
         if not path.exists():
             raise FileNotFoundError(
                 f"{name} does not exist:\n{path}"
@@ -681,15 +769,16 @@ def main() -> None:
 
     run_inference(
         mni_mri_path=args.mni_mri,
-        model_results=args.model_results,
+        checkpoint_path=args.checkpoint,
+        dataset_json_path=args.dataset_json,
+        plans_json_path=args.plans_json,
         affine_path=args.affine,
         native_mri_path=args.native_mri,
         output_dir=args.output_dir,
-        dataset_id=args.dataset_id,
         configuration=args.configuration,
-        trainer=args.trainer,
         fold=args.fold,
         threshold=args.threshold,
+        tile_step_size=args.tile_step_size,
         visualize=not args.no_visualization,
     )
 
