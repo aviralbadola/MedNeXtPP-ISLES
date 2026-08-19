@@ -5,7 +5,9 @@ Pipeline
 --------
 MNI-space MRI
     -> trained MedNeXt++ checkpoint
-    -> MNI-space segmentation
+    -> probability prediction
+    -> probability thresholding
+    -> MNI-space binary segmentation
     -> inverse affine transformation
     -> native-space segmentation
     -> optional visualization
@@ -14,10 +16,11 @@ MNI-space MRI
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 import shutil
-import tempfile
 
 import ants
 import matplotlib.pyplot as plt
@@ -54,7 +57,7 @@ def inverse_transform(
 
 
 # =============================================================================
-# VISUALIZATION UTILITIES
+# VISUALIZATION
 # =============================================================================
 
 def crop_to_brain(
@@ -95,15 +98,15 @@ def visualize_prediction(
     save_path: Path,
 ) -> None:
     """
-    Create axial, coronal and sagittal views of the native-space
-    MedNeXt++ prediction.
+    Create axial, coronal and sagittal views of the
+    native-space MedNeXt++ prediction.
     """
 
     raw = native_mri.numpy()
     prediction = native_prediction.numpy().astype(bool)
 
     # -------------------------------------------------------------------------
-    # Select the slices containing the largest predicted lesion
+    # Select slices containing the largest predicted lesion
     # -------------------------------------------------------------------------
 
     if np.any(prediction):
@@ -159,7 +162,10 @@ def visualize_prediction(
                 prediction[idx, :, :]
             )
 
-        # Crop around the brain
+        # ---------------------------------------------------------------------
+        # Crop around brain
+        # ---------------------------------------------------------------------
+
         mri, row_slice, col_slice = crop_to_brain(mri)
 
         pred = pred[row_slice, col_slice]
@@ -205,7 +211,6 @@ def visualize_prediction(
         )
 
     for ax in axes.ravel():
-
         ax.set_xticks([])
         ax.set_yticks([])
 
@@ -242,7 +247,7 @@ def visualize_prediction(
 
 
 # =============================================================================
-# MNI-SPACE INFERENCE
+# MNI-SPACE MODEL INFERENCE
 # =============================================================================
 
 def run_model_inference(
@@ -252,11 +257,13 @@ def run_model_inference(
     configuration: str,
     trainer: str,
     fold: int,
+    threshold: float = 0.35,
 ) -> Path:
     """
     Run nnU-Net inference using the trained MedNeXt++ model.
 
-    The input MRI is temporarily placed in nnU-Net's expected input layout.
+    The model produces probability maps, after which a custom lesion
+    probability threshold is applied to generate a binary MNI-space mask.
     """
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -270,14 +277,10 @@ def run_model_inference(
         output_dir.mkdir()
 
         # ---------------------------------------------------------------------
-        # nnU-Net expects:
-        #
-        # case_0000.nii.gz
+        # nnU-Net expected input
         # ---------------------------------------------------------------------
 
-        input_case = (
-            input_dir / "case_0000.nii.gz"
-        )
+        input_case = input_dir / "case_0000.nii.gz"
 
         shutil.copy2(
             mni_mri,
@@ -285,7 +288,7 @@ def run_model_inference(
         )
 
         # ---------------------------------------------------------------------
-        # Run nnU-Net prediction
+        # Run nnU-Net inference
         # ---------------------------------------------------------------------
 
         command = [
@@ -312,17 +315,10 @@ def run_model_inference(
             "--save_probabilities",
         ]
 
-        # nnU-Net discovers the trained model through nnUNet_results.
-        env = None
+        env = os.environ.copy()
 
         if model_results is not None:
-            import os
-
-            env = os.environ.copy()
-
-            env["nnUNet_results"] = str(
-                model_results
-            )
+            env["nnUNet_results"] = str(model_results)
 
         print("\nRunning MedNeXt++ inference...")
         print(" ".join(command))
@@ -333,34 +329,89 @@ def run_model_inference(
             env=env,
         )
 
-        prediction = (
-            output_dir /
-            "case.nii.gz"
-        )
+        # ---------------------------------------------------------------------
+        # Load saved probability map
+        # ---------------------------------------------------------------------
 
-        if not prediction.exists():
+        probability_file = output_dir / "case.npz"
+
+        if not probability_file.exists():
             raise RuntimeError(
-                "nnU-Net inference completed, "
-                "but prediction was not found:\n"
-                f"{prediction}"
+                "nnU-Net probability file was not found:\n"
+                f"{probability_file}"
             )
 
-        # Copy prediction outside temporary directory
-        final_prediction = (
-            Path.cwd() /
-            "prediction_mni.nii.gz"
+        probability_data = np.load(
+            probability_file
         )
 
-        shutil.copy2(
-            prediction,
-            final_prediction,
+        if "probabilities" not in probability_data:
+            raise RuntimeError(
+                "The .npz file does not contain a 'probabilities' array."
+            )
+
+        probabilities = probability_data["probabilities"]
+
+        # ---------------------------------------------------------------------
+        # Binary lesion segmentation
+        #
+        # Channel 1 = lesion probability for binary segmentation
+        # ---------------------------------------------------------------------
+
+        if probabilities.ndim < 2:
+            raise RuntimeError(
+                f"Unexpected probability shape: {probabilities.shape}"
+            )
+
+        if probabilities.shape[0] < 2:
+            raise RuntimeError(
+                "Expected a background channel and a lesion channel."
+            )
+
+        lesion_probability = probabilities[1]
+
+        prediction_binary = (
+            lesion_probability >= threshold
+        ).astype(np.uint8)
+
+        # ---------------------------------------------------------------------
+        # Use MNI MRI geometry for output mask
+        # ---------------------------------------------------------------------
+
+        mni_reference = ants.image_read(
+            str(mni_mri)
         )
+
+        prediction_mni_ants = ants.from_numpy(
+            prediction_binary,
+            origin=mni_reference.origin,
+            spacing=mni_reference.spacing,
+            direction=mni_reference.direction,
+        )
+
+        final_prediction = (
+            Path.cwd() / "prediction_mni.nii.gz"
+        )
+
+        ants.image_write(
+            prediction_mni_ants,
+            str(final_prediction),
+        )
+
+        print(
+            f"\nApplied probability threshold: {threshold:.2f}"
+        )
+
+        print(
+            "\nMNI-space prediction saved to:"
+        )
+        print(final_prediction)
 
     return final_prediction
 
 
 # =============================================================================
-# COMPLETE PIPELINE
+# COMPLETE INFERENCE PIPELINE
 # =============================================================================
 
 def run_inference(
@@ -373,6 +424,7 @@ def run_inference(
     configuration: str = "3d_fullres",
     trainer: str = "nnUNetTrainer_MedNeXtPP",
     fold: int = 0,
+    threshold: float = 0.35,
     visualize: bool = True,
 ) -> Path:
     """
@@ -382,7 +434,11 @@ def run_inference(
             ↓
         MedNeXt++
             ↓
-        MNI prediction
+        probability map
+            ↓
+        threshold = 0.35
+            ↓
+        MNI binary prediction
             ↓
         inverse affine
             ↓
@@ -415,9 +471,13 @@ def run_inference(
         configuration=configuration,
         trainer=trainer,
         fold=fold,
+        threshold=threshold,
     )
 
-    # Move MNI prediction into output directory
+    # -------------------------------------------------------------------------
+    # Move MNI prediction to output directory
+    # -------------------------------------------------------------------------
+
     mni_prediction_output = (
         output_dir /
         "prediction_mni.nii.gz"
@@ -463,6 +523,7 @@ def run_inference(
     print(
         "\nNative prediction saved to:"
     )
+
     print(
         native_prediction_path
     )
@@ -485,8 +546,9 @@ def run_inference(
         )
 
         print(
-            "Visualization saved to:"
+            "\nVisualization saved to:"
         )
+
         print(
             visualization_path
         )
@@ -575,6 +637,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.35,
+        help="Probability threshold for lesion segmentation.",
+    )
+
+    parser.add_argument(
         "--no-visualization",
         action="store_true",
         help="Do not generate the visualization.",
@@ -583,9 +652,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main() -> None:
 
     args = parse_args()
+
+    if not 0.0 < args.threshold < 1.0:
+        raise ValueError(
+            "Threshold must be between 0 and 1."
+        )
 
     required = {
         "MNI MRI": args.mni_mri,
@@ -611,6 +689,7 @@ def main() -> None:
         configuration=args.configuration,
         trainer=args.trainer,
         fold=args.fold,
+        threshold=args.threshold,
         visualize=not args.no_visualization,
     )
 
